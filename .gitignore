@@ -25,6 +25,9 @@ get_start.md
 *.swp
 *.swo
 
+# Local scripts (user-specific, not tracked)
+local_scripts/
+
 # Python
 *.so
 .venv/
