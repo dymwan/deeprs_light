@@ -1,0 +1,32 @@
+# macOS metadata
+._*
+.DS_Store
+__pycache__/
+*.pyc
+*.pyo
+.eggs/
+*.egg-info/
+dist/
+build/
+
+# Claude-related files
+CLAUDE.md
+.claude/
+.memory/
+.claude.json
+
+# Design docs (not code)
+Document.md
+get_start.md
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Python
+*.so
+.venv/
+venv/
+env/
