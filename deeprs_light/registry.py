@@ -120,4 +120,5 @@ class Registry:
 # Pre-created global registries
 DATASETS = Registry("datasets")
 TRANSFORMS = Registry("transforms")
+MODELS = Registry("models")
 CACHE_BACKENDS = Registry("cache_backends")

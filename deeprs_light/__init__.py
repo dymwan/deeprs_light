@@ -1,3 +1,3 @@
-from deeprs_light.registry import Registry, DATASETS, TRANSFORMS, CACHE_BACKENDS
+from deeprs_light.registry import Registry, DATASETS, TRANSFORMS, MODELS, CACHE_BACKENDS
 
 __version__ = "0.1.0"
