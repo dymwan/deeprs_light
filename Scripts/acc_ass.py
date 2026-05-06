@@ -738,158 +738,159 @@ def _empty_result(precision: str) -> Dict:
 
 class BatchAccumulator:
     """
-    Accumulates intermediate per-pair results and computes overall metrics.
-
-    This ensures overall metrics are computed from correctly accumulated
-    raw statistics (TP/FP/FN counts, areas, distances), NOT from averaging
-    per-pair derived metrics.
+    Accumulates intermediate per-pair results and computes overall metrics,
+    grouped by mode. Different modes (e.g., 00 vs 11) have different
+    counting semantics (object-level vs pixel-level), so overall metrics
+    are computed independently per mode.
 
     Usage:
         acc = BatchAccumulator(precisions=["cm", "go"], iou_threshold=0.5)
         for each pair:
             result = dispatch(...)
-            acc.update("pair_name", result)
+            acc.update("pair_name", "11", result)
         overall = acc.finalize()
+        # overall = {"11": {"GTC": 0.75, ...}}
     """
 
     def __init__(self, precisions: List[str], iou_threshold: float = 0.5):
         self.precisions = precisions
         self.iou_threshold = iou_threshold
-        self._num_pairs = 0
-        self._init_accumulators()
+        self._modes: Dict[str, Dict] = {}  # mode -> per-precision accumulator data
 
-    def _init_accumulators(self):
-        """Initialize per-precision accumulators."""
-        # cm: per-class tp/fp/fn + global totals
-        self._cm_raw = {}       # class_id -> {"tp": int, "fp": int, "fn": int}
-        self._cm_classes = set()
-        self._cm_class_names = []
-        self._cm_total_tp = 0
-        self._cm_total_fp = 0
-        self._cm_total_fn = 0
+    def _ensure_mode(self, mode: str):
+        """Initialize accumulator storage for a mode if not already present."""
+        if mode not in self._modes:
+            self._modes[mode] = {
+                "num_pairs": 0,
+                # cm
+                "cm_raw": {},
+                "cm_classes": set(),
+                "cm_class_names": [],
+                "cm_total_tp": 0,
+                "cm_total_fp": 0,
+                "cm_total_fn": 0,
+                # ap
+                "ap_gt_anns": [],
+                "ap_pred_results": [],
+                "ap_categories": [],
+                "ap_image_counter": 0,
+                # go
+                "go_tp": 0,
+                "go_fn": 0,
+                "go_total_gt_area": 0.0,
+                "go_inter_area_sum": 0.0,
+                "go_weighted_sum": 0.0,
+                # pl
+                "pl_distances": [],
+            }
 
-        # ap: accumulated COCO data
-        self._ap_gt_anns = []
-        self._ap_pred_results = []
-        self._ap_categories = []
-        self._ap_image_counter = 0
-
-        # go: accumulated counts + areas
-        self._go_tp = 0
-        self._go_fn = 0
-        self._go_total_gt_area = 0.0
-        self._go_inter_area_sum = 0.0
-        self._go_weighted_sum = 0.0
-
-        # pl: accumulated distances
-        self._pl_distances = []
-
-    def update(self, name: str, result: Dict):
+    def update(self, name: str, mode: str, result: Dict):
         """
         Accumulate intermediate results from one pair.
 
         Args:
-            name: Pair name (e.g., from pairs CSV "name" column).
+            name: Pair name (for logging).
+            mode: Mode string (e.g., "00", "11").
             result: The full result dict returned by dispatch().
         """
         inter = result.get("_intermediate", {})
         if not inter:
             return
+        self._ensure_mode(mode)
+        store = self._modes[mode]
         prec_type = inter["type"]
-        self._num_pairs += 1
+        store["num_pairs"] += 1
 
         if prec_type == "cm":
-            self._accumulate_cm(inter)
+            self._accumulate_cm(store, inter)
         elif prec_type == "ap":
-            self._accumulate_ap(inter)
+            self._accumulate_ap(store, inter)
         elif prec_type == "go":
-            self._accumulate_go(inter)
+            self._accumulate_go(store, inter)
         elif prec_type == "pl":
-            self._accumulate_pl(inter)
+            self._accumulate_pl(store, inter)
 
-    def _accumulate_cm(self, inter: Dict):
+    def _accumulate_cm(self, store: Dict, inter: Dict):
         raw = inter.get("raw", {})
-        self._cm_classes.update(inter.get("all_classes", []))
-        self._cm_class_names = inter.get("class_names", [])
-        self._cm_total_tp += inter.get("total_tp", 0)
-        self._cm_total_fp += inter.get("total_fp", 0)
-        self._cm_total_fn += inter.get("total_fn", 0)
+        store["cm_classes"].update(inter.get("all_classes", []))
+        store["cm_class_names"] = inter.get("class_names", [])
+        store["cm_total_tp"] += inter.get("total_tp", 0)
+        store["cm_total_fp"] += inter.get("total_fp", 0)
+        store["cm_total_fn"] += inter.get("total_fn", 0)
 
         for cls_id, cnt in raw.items():
-            if cls_id not in self._cm_raw:
-                self._cm_raw[cls_id] = {"tp": 0, "fp": 0, "fn": 0}
-            self._cm_raw[cls_id]["tp"] += cnt["tp"]
-            self._cm_raw[cls_id]["fp"] += cnt["fp"]
-            self._cm_raw[cls_id]["fn"] += cnt["fn"]
+            if cls_id not in store["cm_raw"]:
+                store["cm_raw"][cls_id] = {"tp": 0, "fp": 0, "fn": 0}
+            store["cm_raw"][cls_id]["tp"] += cnt["tp"]
+            store["cm_raw"][cls_id]["fp"] += cnt["fp"]
+            store["cm_raw"][cls_id]["fn"] += cnt["fn"]
 
-    def _accumulate_ap(self, inter: Dict):
+    def _accumulate_ap(self, store: Dict, inter: Dict):
         gt_anns = inter.get("gt_anns", [])
         pred_results = inter.get("pred_results", [])
         categories = inter.get("categories", [])
 
-        # Re-index annotations with unique image_id per pair
-        img_id = self._ap_image_counter + 1
-        ann_offset = len(self._ap_gt_anns)
+        img_id = store["ap_image_counter"] + 1
+        ann_offset = len(store["ap_gt_anns"])
 
         for ann in gt_anns:
             ann = dict(ann)
             ann["id"] += ann_offset
             ann["image_id"] = img_id
-            self._ap_gt_anns.append(ann)
+            store["ap_gt_anns"].append(ann)
 
         for pred in pred_results:
             pred = dict(pred)
             pred["image_id"] = img_id
-            self._ap_pred_results.append(pred)
+            store["ap_pred_results"].append(pred)
 
         if categories:
-            self._ap_categories = categories  # use last pair's categories
-        self._ap_image_counter += 1
+            store["ap_categories"] = categories
+        store["ap_image_counter"] += 1
 
-    def _accumulate_go(self, inter: Dict):
-        self._go_tp += inter.get("tp", 0)
-        self._go_fn += inter.get("fn", 0)
-        self._go_total_gt_area += inter.get("total_gt_area", 0.0)
-        self._go_inter_area_sum += inter.get("inter_area_sum", 0.0)
-        self._go_weighted_sum += inter.get("weighted_sum", 0.0)
+    def _accumulate_go(self, store: Dict, inter: Dict):
+        store["go_tp"] += inter.get("tp", 0)
+        store["go_fn"] += inter.get("fn", 0)
+        store["go_total_gt_area"] += inter.get("total_gt_area", 0.0)
+        store["go_inter_area_sum"] += inter.get("inter_area_sum", 0.0)
+        store["go_weighted_sum"] += inter.get("weighted_sum", 0.0)
 
-    def _accumulate_pl(self, inter: Dict):
-        self._pl_distances.extend(inter.get("distances", []))
+    def _accumulate_pl(self, store: Dict, inter: Dict):
+        store["pl_distances"].extend(inter.get("distances", []))
 
-    def finalize(self) -> Dict:
+    def finalize(self) -> Dict[str, Dict]:
         """
-        Compute overall metrics from accumulated intermediates.
+        Compute overall metrics for each mode independently.
 
         Returns:
-            Flat dict of metric_name -> value (no nested structure).
+            Dict[mode_str -> flat_dict of metric_name -> value]
+            e.g. {"00": {"macro_precision": ..., "GTC": ...},
+                   "11": {"macro_precision": ..., "GTC": ...}}
         """
         overall = {}
+        for mode in sorted(self._modes.keys()):
+            store = self._modes[mode]
+            mode_result = {}
 
-        # --- cm finalize ---
-        if "cm" in self.precisions:
-            overall.update(self._finalize_cm())
+            if "cm" in self.precisions:
+                mode_result.update(self._finalize_cm(store))
+            if "ap" in self.precisions:
+                mode_result.update(self._finalize_ap(store))
+            if "go" in self.precisions:
+                mode_result.update(self._finalize_go(store))
+            if "pl" in self.precisions:
+                mode_result.update(self._finalize_pl(store))
 
-        # --- ap finalize ---
-        if "ap" in self.precisions:
-            overall.update(self._finalize_ap())
-
-        # --- go finalize ---
-        if "go" in self.precisions:
-            overall.update(self._finalize_go())
-
-        # --- pl finalize ---
-        if "pl" in self.precisions:
-            overall.update(self._finalize_pl())
-
+            overall[mode] = mode_result
         return overall
 
-    def _finalize_cm(self) -> Dict:
-        all_classes = sorted(self._cm_classes)
+    def _finalize_cm(self, store: Dict) -> Dict:
+        all_classes = sorted(store["cm_classes"])
         n = len(all_classes) or 1
 
         per_class = {}
         for c in all_classes:
-            cnt = self._cm_raw.get(c, {"tp": 0, "fp": 0, "fn": 0})
+            cnt = store["cm_raw"].get(c, {"tp": 0, "fp": 0, "fn": 0})
             tp, fp, fn = cnt["tp"], cnt["fp"], cnt["fn"]
             p = tp / (tp + fp) if (tp + fp) > 0 else 0.0
             r = tp / (tp + fn) if (tp + fn) > 0 else 0.0
@@ -912,7 +913,7 @@ class BatchAccumulator:
         flat["macro_f1"] = macro_f1
         flat["macro_iou"] = macro_iou
 
-        tp, fp, fn = self._cm_total_tp, self._cm_total_fp, self._cm_total_fn
+        tp, fp, fn = store["cm_total_tp"], store["cm_total_fp"], store["cm_total_fn"]
         mp = tp / (tp + fp) if (tp + fp) > 0 else 0.0
         mr = tp / (tp + fn) if (tp + fn) > 0 else 0.0
         flat["micro_precision"] = mp
@@ -921,8 +922,8 @@ class BatchAccumulator:
         flat["micro_iou"] = tp / (tp + fp + fn) if (tp + fp + fn) > 0 else 0.0
         return flat
 
-    def _finalize_ap(self) -> Dict:
-        if len(self._ap_gt_anns) == 0:
+    def _finalize_ap(self, store: Dict) -> Dict:
+        if len(store["ap_gt_anns"]) == 0:
             return {"AP": 0.0, "AP50": 0.0, "AP75": 0.0,
                     "AP_s": 0.0, "AP_m": 0.0, "AP_l": 0.0,
                     "AR1": 0.0, "AR10": 0.0, "AR100": 0.0,
@@ -932,35 +933,34 @@ class BatchAccumulator:
         from pycocotools.coco import COCO
         from deeprs_light.evaluator.coco_eval import evaluate_coco
 
-        # Build combined GT with unique image IDs
         images = [{"id": i + 1, "file_name": f"img_{i+1}", "width": 100000, "height": 100000}
-                  for i in range(self._ap_image_counter)]
-        gt_coco = {"images": images, "annotations": self._ap_gt_anns,
-                   "categories": self._ap_categories}
+                  for i in range(store["ap_image_counter"])]
+        gt_coco = {"images": images, "annotations": store["ap_gt_anns"],
+                   "categories": store["ap_categories"]}
 
         with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
             json.dump(gt_coco, f)
             tmp_path = f.name
         try:
             coco_gt = COCO(tmp_path)
-            coco_dt = coco_gt.loadRes(self._ap_pred_results)
+            coco_dt = coco_gt.loadRes(store["ap_pred_results"])
             return evaluate_coco(coco_gt, coco_dt, iou_type="bbox")
         finally:
             os.unlink(tmp_path)
 
-    def _finalize_go(self) -> Dict:
-        gtc = self._go_tp / (self._go_tp + self._go_fn) if (self._go_tp + self._go_fn) > 0 else 0.0
-        goc = self._go_inter_area_sum / self._go_total_gt_area if self._go_total_gt_area > 0 else 0.0
-        guc = self._go_weighted_sum / self._go_total_gt_area if self._go_total_gt_area > 0 else 0.0
+    def _finalize_go(self, store: Dict) -> Dict:
+        gtc = store["go_tp"] / (store["go_tp"] + store["go_fn"]) if (store["go_tp"] + store["go_fn"]) > 0 else 0.0
+        goc = store["go_inter_area_sum"] / store["go_total_gt_area"] if store["go_total_gt_area"] > 0 else 0.0
+        guc = store["go_weighted_sum"] / store["go_total_gt_area"] if store["go_total_gt_area"] > 0 else 0.0
         return {"GTC": gtc, "GOC": goc, "GUC": guc}
 
-    def _finalize_pl(self) -> Dict:
-        if not self._pl_distances:
+    def _finalize_pl(self, store: Dict) -> Dict:
+        if not store["pl_distances"]:
             return {"PoLis_mean_dist": 0.0, "PoLis_std_dist": 0.0,
                     "PoLis_median_dist": 0.0, "PoLis_max_dist": 0.0,
                     "PoLis_rmse": 0.0, "PoLis_buffer_rate": 0.0}
-        d = np.array(self._pl_distances)
-        buf_dist = 2.0  # default
+        d = np.array(store["pl_distances"])
+        buf_dist = 2.0
         return {
             "PoLis_mean_dist": float(np.mean(d)),
             "PoLis_std_dist": float(np.std(d)),
@@ -1111,7 +1111,7 @@ def run_batch(args, precisions, pred_field, gt_field, band):
 
     print(f"[acc_ass] Batch mode: {len(pairs)} pairs, precision={precisions}")
 
-    # Initialize accumulator per precision
+    # Initialize accumulator per precision (internally manages per-mode storage)
     accumulators = {prec: BatchAccumulator([prec], args.iou) for prec in precisions}
 
     all_rows = []
@@ -1130,7 +1130,7 @@ def run_batch(args, precisions, pred_field, gt_field, band):
             inter = result.get("_intermediate", {})
 
             if inter:
-                accumulators[prec].update(name, result)
+                accumulators[prec].update(name, mode, result)
 
             # Per-pair metrics
             flat = _extract_final(prec, result)
@@ -1144,17 +1144,19 @@ def run_batch(args, precisions, pred_field, gt_field, band):
                     print(f" {k}={v:.4f}", end="")
             print()
 
-    # Compute and write overall metrics
-    print("\n[acc_ass] Computing overall metrics...")
+    # Compute and write overall metrics (per mode)
+    print("\n[acc_ass] Computing overall metrics (per mode)...")
     for prec in precisions:
-        overall = accumulators[prec].finalize()
-        rows = result_to_rows(prec, "overall", overall)
-        all_rows.extend(rows)
-        print(f"  [{prec} overall]", end="")
-        for k, v in overall.items():
-            if isinstance(v, float):
-                print(f" {k}={v:.4f}", end="")
-        print()
+        overall_by_mode = accumulators[prec].finalize()
+        for mode_str, overall in overall_by_mode.items():
+            pair_label = f"overall_mode_{mode_str}"
+            rows = result_to_rows(prec, pair_label, overall)
+            all_rows.extend(rows)
+            print(f"  [{prec} {pair_label}]", end="")
+            for k, v in overall.items():
+                if isinstance(v, float):
+                    print(f" {k}={v:.4f}", end="")
+            print()
 
     write_csv_rows(all_rows, args.output)
     print(f"\n[acc_ass] Results saved to '{args.output}'")
