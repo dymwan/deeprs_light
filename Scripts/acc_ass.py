@@ -6,18 +6,21 @@ Supports vector (shapefile, geopackage) and raster (GeoTIFF) inputs
 with multiple precision types: confusion matrix (cm), average precision (ap),
 geometric quality (go), and point/line statistics (pl).
 
-Usage:
+Usage — single pair:
     python Scripts/acc_ass.py \
-        --pred pred.shp \
-        --gt gt.tif \
-        --mode 10 \
-        --precision cm,ap \
-        --output results.csv
+        --pred pred.shp --gt gt.tif --mode 10 \
+        --precision cm,ap --output results.csv
+
+Usage — batch (multiple pairs + overall):
+    python Scripts/acc_ass.py \
+        --pairs pairs.csv \
+        --precision all --output results.csv
 
 See Scripts/readme.md for full documentation.
 """
 
 import argparse
+import csv as csv_module
 import os
 import sys
 from typing import Dict, List, Optional, Tuple, Union
@@ -36,17 +39,25 @@ def parse_args():
     parser = argparse.ArgumentParser(
         description="Remote sensing accuracy assessment (vector & raster)."
     )
-    parser.add_argument("--pred", required=True, help="Prediction file path (shp/gpkg/tif).")
-    parser.add_argument("--gt", required=True, help="Ground truth file path (shp/gpkg/tif).")
-    parser.add_argument("--mode", required=True,
-                       help="Mode string 'xy': x=pred type, y=gt type. "
-                            "0=vector, 1=binary/multi-value raster, 2=continuous raster.")
+    # Mutually exclusive: single pair vs batch CSV
+    single_group = parser.add_argument_group("Single pair mode")
+    single_group.add_argument("--pred", default=None, help="Prediction file path (shp/gpkg/tif).")
+    single_group.add_argument("--gt", default=None, help="Ground truth file path (shp/gpkg/tif).")
+    single_group.add_argument("--mode", default=None,
+                              help="Mode string 'xy': 0=vector, 1=raster, 2=continuous.")
+
+    batch_group = parser.add_argument_group("Batch mode")
+    batch_group.add_argument("--pairs", default=None,
+                             help="CSV file with columns: name,pred,gt,mode. "
+                                  "Each row is one prediction-ground truth pair. "
+                                  "Overall metrics are automatically computed.")
+
     parser.add_argument("--precision", required=True,
-                       help="Precision types: cm, ap, go, pl. Comma-separated or 'all'.")
+                        help="Precision types: cm, ap, go, pl. Comma-separated or 'all'.")
     parser.add_argument("--output", required=True, help="Output CSV path.")
     parser.add_argument("--field", default=None,
-                       help="Class field name(s). Single string for both, "
-                            "or 'pred_field,gt_field' for separate.")
+                        help="Class field name(s). Single string for both, "
+                             "or 'pred_field,gt_field' for separate.")
     parser.add_argument("--band", type=int, default=None, help="Raster band index (default: 1).")
     parser.add_argument("--iou", type=float, default=0.5, help="IoU threshold (default: 0.5).")
     return parser.parse_args()
@@ -68,13 +79,6 @@ def validate_mode(mode: str):
 
 
 def parse_field(field: Optional[str]) -> Tuple[Optional[str], Optional[str]]:
-    """
-    Parse field argument into (pred_field, gt_field).
-
-    - None -> (None, None)
-    - "class_id" -> ("class_id", "class_id")
-    - "f1,f2" -> ("f1", "f2")  (length must be 2)
-    """
     if field is None:
         return None, None
     parts = [f.strip() for f in field.split(",")]
@@ -88,7 +92,6 @@ def parse_field(field: Optional[str]) -> Tuple[Optional[str], Optional[str]]:
 
 
 def parse_precisions(precision_str: str) -> List[str]:
-    """Parse precision types. 'all' -> ['cm', 'ap', 'go', 'pl']."""
     if precision_str.strip().lower() == "all":
         return ["cm", "ap", "go", "pl"]
     parts = [p.strip().lower() for p in precision_str.split(",")]
@@ -104,13 +107,11 @@ def parse_precisions(precision_str: str) -> List[str]:
 # ============================================================
 
 def _is_raster(path: str) -> bool:
-    """Check if a file is a raster (GeoTIFF) by extension."""
     ext = os.path.splitext(path)[1].lower()
     return ext in (".tif", ".tiff", ".vrt")
 
 
 def _is_vector(path: str) -> bool:
-    """Check if a file is a vector by extension."""
     ext = os.path.splitext(path)[1].lower()
     return ext in (".shp", ".gpkg", ".geojson", ".gml", ".kml")
 
@@ -122,27 +123,14 @@ def _is_vector(path: str) -> bool:
 def load_vector(
     path: str, field: Optional[str] = None,
 ) -> Tuple[np.ndarray, np.ndarray, List[str], int, object]:
-    """
-    Load a vector file and extract boxes + labels.
-
-    Args:
-        path: Path to shp/gpkg/geojson.
-        field: Attribute field for class labels. None = all class 0 (binary).
-
-    Returns:
-        (boxes_xyxy[N,4], labels[N], class_names, num_classes, crs)
-    """
     try:
         import geopandas as gpd
     except ImportError:
         raise ImportError("geopandas is required for vector loading. pip install geopandas")
 
     gdf = gpd.read_file(path)
-    if gdf.crs is None:
-        print(f"[WARN] No CRS found in '{path}'. Assuming same CRS as counterpart.")
     crs = gdf.crs
 
-    # Extract bounding boxes from geometry
     boxes = []
     for geom in gdf.geometry:
         if geom is None or geom.is_empty:
@@ -152,10 +140,8 @@ def load_vector(
             boxes.append([minx, miny, maxx, maxy])
     boxes = np.array(boxes, dtype=np.float32)
 
-    # Extract labels
     if field is not None and field in gdf.columns:
         labels = gdf[field].values
-        # Convert to integer class IDs
         unique_vals = sorted(set(labels))
         val_to_id = {v: i for i, v in enumerate(unique_vals)}
         labels = np.array([val_to_id[v] for v in labels], dtype=np.int64)
@@ -171,16 +157,6 @@ def load_vector(
 def load_raster(
     path: str, band: Optional[int] = None,
 ) -> Tuple[np.ndarray, object, object]:
-    """
-    Load a raster file.
-
-    Args:
-        path: Path to GeoTIFF.
-        band: Band index (1-based). None defaults to 1.
-
-    Returns:
-        (array[H,W], geotransform, crs)
-    """
     try:
         import rasterio
     except ImportError:
@@ -200,26 +176,7 @@ def load_raster(
 def load_data(
     path: str, data_type: str, band: Optional[int], field: Optional[str],
 ) -> Dict:
-    """
-    Unified data loader. Returns a dict describing the loaded data.
-
-    Returns:
-    {
-        "type": "vector" | "raster",
-        "path": str,
-        # Vector fields:
-        "boxes": np.ndarray,    # [N,4] xyxy
-        "labels": np.ndarray,   # [N]
-        "class_names": List[str],
-        "num_classes": int,
-        "crs": ...,
-        # Raster fields:
-        "array": np.ndarray,    # [H,W]
-        "transform": ...,
-    }
-    """
     data_type = int(data_type)
-
     if data_type == 0:
         if not _is_vector(path):
             raise ValueError(
@@ -227,24 +184,17 @@ def load_data(
             )
         boxes, labels, class_names, num_classes, crs = load_vector(path, field)
         return {
-            "type": "vector",
-            "path": path,
-            "boxes": boxes,
-            "labels": labels,
-            "class_names": class_names,
-            "num_classes": num_classes,
-            "crs": crs,
+            "type": "vector", "path": path,
+            "boxes": boxes, "labels": labels,
+            "class_names": class_names, "num_classes": num_classes, "crs": crs,
         }
     elif data_type == 1:
         if not _is_raster(path):
             print(f"[WARN] Mode expects raster (type 1), but '{path}' does not look like a tif.")
         arr, transform, crs = load_raster(path, band)
         return {
-            "type": "raster",
-            "path": path,
-            "array": arr,
-            "transform": transform,
-            "crs": crs,
+            "type": "raster", "path": path,
+            "array": arr, "transform": transform, "crs": crs,
         }
     else:
         raise NotImplementedError(f"Data type {data_type} not supported.")
@@ -255,67 +205,39 @@ def load_data(
 # ============================================================
 
 def raster_to_vector(
-    raster: np.ndarray,
-    transform=None,
-    crs=None,
+    raster: np.ndarray, transform=None, crs=None,
 ) -> Tuple[np.ndarray, np.ndarray, List[str], int]:
-    """
-    Convert a classification raster to vector boxes + labels.
-
-    Uses connected component analysis (cv2) to extract per-class regions
-    and their bounding boxes. Much faster than full polygonization.
-
-    Args:
-        raster: [H, W] integer array (class per pixel).
-
-    Returns:
-        (boxes_xyxy[N,4], labels[N], class_names, num_classes)
-    """
     try:
         import cv2
     except ImportError:
         raise ImportError("opencv-python is required for raster->vector conversion.")
 
     unique_classes = np.unique(raster)
-    # Filter out background (0)
     class_ids = sorted([c for c in unique_classes if c > 0])
 
     if len(class_ids) == 0:
-        return (
-            np.zeros((0, 4), dtype=np.float32),
-            np.zeros((0,), dtype=np.int64),
-            ["background"],
-            1,
-        )
+        return (np.zeros((0, 4), dtype=np.float32),
+                np.zeros((0,), dtype=np.int64), ["background"], 1)
 
-    all_boxes = []
-    all_labels = []
-
+    all_boxes, all_labels = [], []
     for new_label, class_val in enumerate(class_ids):
         binary = (raster == class_val).astype(np.uint8) * 255
-        num_labels, _, stats, _ = cv2.connectedComponentsWithStats(
-            binary, connectivity=8
-        )
-        # stats[0] is the background component, skip it
+        num_labels, _, stats, _ = cv2.connectedComponentsWithStats(binary, connectivity=8)
         for comp_id in range(1, num_labels):
             x, y, w, h, area = stats[comp_id]
-            if area < 4:  # Ignore tiny noise components
+            if area < 4:
                 continue
             all_boxes.append([float(x), float(y), float(x + w), float(y + h)])
             all_labels.append(new_label)
 
     if len(all_boxes) == 0:
-        return (
-            np.zeros((0, 4), dtype=np.float32),
-            np.zeros((0,), dtype=np.int64),
-            [str(c) for c in class_ids],
-            len(class_ids),
-        )
+        return (np.zeros((0, 4), dtype=np.float32),
+                np.zeros((0,), dtype=np.int64),
+                [str(c) for c in class_ids], len(class_ids))
 
     boxes = np.array(all_boxes, dtype=np.float32)
     labels = np.array(all_labels, dtype=np.int64)
     class_names = [str(c) for c in class_ids]
-
     return boxes, labels, class_names, len(class_names)
 
 
@@ -324,28 +246,16 @@ def raster_to_vector(
 # ============================================================
 
 def pixel_confusion_matrix(
-    pred: np.ndarray,
-    gt: np.ndarray,
+    pred: np.ndarray, gt: np.ndarray,
     class_names: Optional[List[str]] = None,
 ) -> Dict:
-    """
-    Pixel-level confusion matrix computation. O(H*W), very fast.
-
-    Args:
-        pred: [H, W] int, predicted class per pixel.
-        gt: [H, W] int, ground truth class per pixel.
-
-    Returns:
-        Dict with per_class, macro_avg, micro_avg precision/recall/f1/iou.
-    """
-    # Find all unique classes in pred and gt
+    """Pixel-level confusion matrix. Returns intermediate + final."""
     all_classes = sorted(set(np.unique(pred)) | set(np.unique(gt)))
-    num_classes = len(all_classes)
-
     if class_names is None:
         class_names = [str(c) for c in all_classes]
 
     per_class = {}
+    raw = {}  # intermediate: per-class tp/fp/fn
     total_tp, total_fp, total_fn = 0, 0, 0
 
     for idx, c in enumerate(all_classes):
@@ -353,25 +263,22 @@ def pixel_confusion_matrix(
         fp = int(np.sum((pred == c) & (gt != c)))
         fn = int(np.sum((pred != c) & (gt == c)))
 
-        precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
-        recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
-        f1 = (2 * precision * recall / (precision + recall)
-              if (precision + recall) > 0 else 0.0)
+        raw[int(c)] = {"tp": tp, "fp": fp, "fn": fn}
+
+        p = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+        r = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+        f1 = (2 * p * r / (p + r) if (p + r) > 0 else 0.0)
         iou = tp / (tp + fp + fn) if (tp + fp + fn) > 0 else 0.0
 
         per_class[int(c)] = {
             "class_name": class_names[idx],
             "tp": tp, "fp": fp, "fn": fn,
-            "precision": precision,
-            "recall": recall,
-            "f1": f1,
-            "iou": iou,
+            "precision": p, "recall": r, "f1": f1, "iou": iou,
         }
         total_tp += tp
         total_fp += fp
         total_fn += fn
 
-    # Macro average
     n = len(all_classes) or 1
     macro_avg = {
         "precision": sum(v["precision"] for v in per_class.values()) / n,
@@ -379,51 +286,37 @@ def pixel_confusion_matrix(
         "f1": sum(v["f1"] for v in per_class.values()) / n,
         "iou": sum(v["iou"] for v in per_class.values()) / n,
     }
-
-    # Micro average
     mp = total_tp / (total_tp + total_fp) if (total_tp + total_fp) > 0 else 0.0
     mr = total_tp / (total_tp + total_fn) if (total_tp + total_fn) > 0 else 0.0
     micro_avg = {
-        "precision": mp,
-        "recall": mr,
+        "precision": mp, "recall": mr,
         "f1": (2 * mp * mr / (mp + mr) if (mp + mr) > 0 else 0.0),
-        "iou": total_tp / (total_tp + total_fp + total_fn)
-               if (total_tp + total_fp + total_fn) > 0 else 0.0,
+        "iou": total_tp / (total_tp + total_fp + total_fn) if (total_tp + total_fp + total_fn) > 0 else 0.0,
     }
 
     return {
-        "per_class": per_class,
-        "macro_avg": macro_avg,
-        "micro_avg": micro_avg,
+        "_intermediate": {"type": "cm", "raw": raw, "all_classes": all_classes,
+                          "class_names": class_names, "total_tp": total_tp,
+                          "total_fp": total_fp, "total_fn": total_fn},
+        "per_class": per_class, "macro_avg": macro_avg, "micro_avg": micro_avg,
     }
 
 
-def pixel_geometric_quality(
-    pred: np.ndarray,
-    gt: np.ndarray,
-) -> Dict:
-    """
-    Pixel-level geometric quality: GTC, GOC, GUC.
-
-    Args:
-        pred: [H, W] int, predicted class per pixel.
-        gt: [H, W] int, ground truth class per pixel.
-
-    Returns:
-        {"GTC": float, "GOC": float, "GUC": float}
-    """
+def pixel_geometric_quality(pred: np.ndarray, gt: np.ndarray) -> Dict:
+    """Pixel-level geometric quality. Returns intermediate + final."""
     total_gt = int(np.sum(gt > 0))
     if total_gt == 0:
-        return {"GTC": 0.0, "GOC": 0.0, "GUC": 0.0}
+        return {"_intermediate": {"type": "go", "tp": 0, "fn": 0, "total_gt_area": 0,
+                                  "inter_area_sum": 0.0, "weighted_sum": 0.0},
+                "GTC": 0.0, "GOC": 0.0, "GUC": 0.0}
 
-    # GTC: proportion of GT pixels correctly predicted (pixel-level recall)
     tp = int(np.sum((pred > 0) & (gt > 0)))
     fn = int(np.sum((pred == 0) & (gt > 0)))
     gtc = tp / (tp + fn) if (tp + fn) > 0 else 0.0
 
-    # GOC: per-class IoU averaged (geometric completeness)
     all_classes = sorted(set(np.unique(pred)) | set(np.unique(gt)))
     ious = []
+    per_class_data = {}
     for c in all_classes:
         if c == 0:
             continue
@@ -432,116 +325,85 @@ def pixel_geometric_quality(
         fn_c = int(np.sum((pred != c) & (gt == c)))
         iou_c = tp_c / (tp_c + fp_c + fn_c) if (tp_c + fp_c + fn_c) > 0 else 0.0
         ious.append(iou_c)
+        per_class_data[c] = {"tp": tp_c, "fp": fp_c, "fn": fn_c, "iou": iou_c}
     goc = np.mean(ious) if ious else 0.0
+    guc = goc  # pixel level: GUC ~= GOC
 
-    # GUC: weighted GOC — pixel-level usability = whether pixel was correctly classified
-    guc = goc  # At pixel level, GUC ~= GOC (all pixels weighted equally)
+    inter_area_sum = float(sum(p["iou"] * (p["tp"] + p["fp"] + p["fn"]) for p in per_class_data.values()))
+    total_gt_area = float(np.sum(gt > 0))
 
-    return {"GTC": float(gtc), "GOC": float(goc), "GUC": float(guc)}
+    return {
+        "_intermediate": {"type": "go", "tp": tp, "fn": fn,
+                          "total_gt_area": total_gt_area,
+                          "inter_area_sum": inter_area_sum,
+                          "weighted_sum": inter_area_sum,  # pixel-level GUC = GOC
+                          },
+        "GTC": float(gtc), "GOC": float(goc), "GUC": float(guc),
+    }
 
 
 def pixel_polis(
-    pred: np.ndarray,
-    gt: np.ndarray,
-    buffer_distance: float = 2.0,
+    pred: np.ndarray, gt: np.ndarray, buffer_distance: float = 2.0,
 ) -> Dict:
-    """
-    Pixel-level PoLis: extract connected component centroids and compute distances.
-
-    Args:
-        pred: [H, W] int.
-        gt: [H, W] int.
-        buffer_distance: Buffer radius in pixels.
-
-    Returns:
-        PoLis metrics dict.
-    """
+    """Pixel-level PoLis. Returns intermediate + final."""
     try:
         import cv2
     except ImportError:
         raise ImportError("opencv-python is required for PoLis computation.")
 
-    # Extract connected components from GT and compute centroids
+    # Extract GT centroids
     gt_centroids = []
     for c in np.unique(gt):
-        if c == 0:
-            continue
+        if c == 0: continue
         binary = (gt == c).astype(np.uint8) * 255
-        num_labels, _, stats, centroids = cv2.connectedComponentsWithStats(
-            binary, connectivity=8
-        )
+        num_labels, _, stats, centroids = cv2.connectedComponentsWithStats(binary, connectivity=8)
         for comp_id in range(1, num_labels):
-            area = stats[comp_id, cv2.CC_STAT_AREA]
-            if area < 4:
-                continue
+            if stats[comp_id, cv2.CC_STAT_AREA] < 4: continue
             cx, cy = centroids[comp_id]
-            gt_centroids.append({"class": int(c), "cx": cx, "cy": cy, "area": area})
+            gt_centroids.append({"class": int(c), "cx": cx, "cy": cy})
 
-    # Extract centroids from pred
+    # Extract pred centroids
     pred_centroids = []
     for c in np.unique(pred):
-        if c == 0:
-            continue
+        if c == 0: continue
         binary = (pred == c).astype(np.uint8) * 255
-        num_labels, _, stats, centroids = cv2.connectedComponentsWithStats(
-            binary, connectivity=8
-        )
+        num_labels, _, stats, centroids = cv2.connectedComponentsWithStats(binary, connectivity=8)
         for comp_id in range(1, num_labels):
-            area = stats[comp_id, cv2.CC_STAT_AREA]
-            if area < 4:
-                continue
+            if stats[comp_id, cv2.CC_STAT_AREA] < 4: continue
             cx, cy = centroids[comp_id]
-            pred_centroids.append({"class": int(c), "cx": cx, "cy": cy, "area": area})
+            pred_centroids.append({"class": int(c), "cx": cx, "cy": cy})
 
     if len(gt_centroids) == 0 or len(pred_centroids) == 0:
-        return {
-            "PoLis_mean_dist": 0.0,
-            "PoLis_std_dist": 0.0,
-            "PoLis_median_dist": 0.0,
-            "PoLis_max_dist": 0.0,
-            "PoLis_rmse": 0.0,
-            "PoLis_buffer_rate": 0.0,
-        }
+        return {"_intermediate": {"type": "pl", "distances": []},
+                "PoLis_mean_dist": 0.0, "PoLis_std_dist": 0.0,
+                "PoLis_median_dist": 0.0, "PoLis_max_dist": 0.0,
+                "PoLis_rmse": 0.0, "PoLis_buffer_rate": 0.0}
 
-    # Match pred centroids to nearest GT centroids of the same class
-    distances = []
-    gt_matched = set()
     pred_by_class = {}
     for i, p in enumerate(pred_centroids):
         pred_by_class.setdefault(p["class"], []).append((i, p))
 
-    for gt_idx, gt_c in enumerate(gt_centroids):
+    distances = []
+    for gt_c in gt_centroids:
         cls = gt_c["class"]
-        if cls not in pred_by_class:
-            continue
+        if cls not in pred_by_class: continue
         best_dist = float("inf")
-        best_pred_idx = -1
-        for pred_idx, pred_c in pred_by_class[cls]:
-            if pred_idx in set():  # already matched — not applicable for centroid matching
-                continue
-            dist = np.sqrt((gt_c["cx"] - pred_c["cx"]) ** 2 +
-                          (gt_c["cy"] - pred_c["cy"]) ** 2)
-            if dist < best_dist:
-                best_dist = dist
-                best_pred_idx = pred_idx
-        if best_pred_idx >= 0:
-            distances.append(best_dist)
-            gt_matched.add(gt_idx)
+        for _, pred_c in pred_by_class[cls]:
+            dist = np.sqrt((gt_c["cx"] - pred_c["cx"]) ** 2 + (gt_c["cy"] - pred_c["cy"]) ** 2)
+            if dist < best_dist: best_dist = dist
+        distances.append(best_dist)
+
+    distances = np.array(distances) if distances else np.array([])
 
     if len(distances) == 0:
-        return {
-            "PoLis_mean_dist": 0.0,
-            "PoLis_std_dist": 0.0,
-            "PoLis_median_dist": 0.0,
-            "PoLis_max_dist": 0.0,
-            "PoLis_rmse": 0.0,
-            "PoLis_buffer_rate": 0.0,
-        }
+        return {"_intermediate": {"type": "pl", "distances": []},
+                "PoLis_mean_dist": 0.0, "PoLis_std_dist": 0.0,
+                "PoLis_median_dist": 0.0, "PoLis_max_dist": 0.0,
+                "PoLis_rmse": 0.0, "PoLis_buffer_rate": 0.0}
 
-    distances = np.array(distances)
     buffer_rate = float(np.sum(distances <= buffer_distance)) / len(distances)
-
     return {
+        "_intermediate": {"type": "pl", "distances": distances.tolist()},
         "PoLis_mean_dist": float(np.mean(distances)),
         "PoLis_std_dist": float(np.std(distances)),
         "PoLis_median_dist": float(np.median(distances)),
@@ -552,246 +414,220 @@ def pixel_polis(
 
 
 # ============================================================
-# Vector-level Metrics (reuse existing evaluator code)
+# Vector-level Metrics
 # ============================================================
 
 def vector_cm(
-    pred_boxes: np.ndarray,
-    pred_labels: np.ndarray,
-    gt_boxes: np.ndarray,
-    gt_labels: np.ndarray,
-    num_classes: int,
-    class_names: List[str],
-    iou_threshold: float = 0.5,
+    pred_boxes, pred_labels, gt_boxes, gt_labels,
+    num_classes, class_names, iou_threshold=0.5,
 ) -> Dict:
-    """
-    Vector-level confusion matrix using existing ConfusionMatrix class.
-    """
+    """Returns intermediate + final."""
     import torch
     from deeprs_light.evaluator.metrics import ConfusionMatrix
 
-    cm = ConfusionMatrix(
-        num_classes=num_classes,
-        iou_threshold=iou_threshold,
-        class_names=class_names,
-    )
+    if len(gt_boxes) == 0:
+        return {"_intermediate": {"type": "cm", "raw": {}, "all_classes": [],
+                                  "class_names": class_names, "total_tp": 0,
+                                  "total_fp": 0, "total_fn": 0}}
 
+    cm = ConfusionMatrix(num_classes=num_classes, iou_threshold=iou_threshold,
+                         class_names=class_names)
     cm.process_batch(
         gt_boxes=[torch.from_numpy(gt_boxes)],
         gt_labels=[torch.from_numpy(gt_labels).long()],
         dt_boxes=[torch.from_numpy(pred_boxes)],
         dt_labels=[torch.from_numpy(pred_labels).long()],
-        dt_scores=[torch.ones(len(pred_labels))],  # All scores = 1.0
+        dt_scores=[torch.ones(len(pred_labels))],
     )
 
-    return cm.compute(metrics=["precision", "recall", "f1"])
+    raw = {}
+    total_tp, total_fp, total_fn = 0, 0, 0
+    all_classes = sorted(cm._counts.keys())
+
+    for c in all_classes:
+        cnt = cm._counts[c]
+        raw[c] = {"tp": cnt["tp"], "fp": cnt["fp"], "fn": cnt["fn"]}
+        total_tp += cnt["tp"]
+        total_fp += cnt["fp"]
+        total_fn += cnt["fn"]
+
+    result = cm.compute(metrics=["precision", "recall", "f1"])
+    result["_intermediate"] = {
+        "type": "cm", "raw": raw, "all_classes": all_classes,
+        "class_names": class_names, "total_tp": total_tp,
+        "total_fp": total_fp, "total_fn": total_fn,
+    }
+    return result
 
 
 def vector_ap(
-    pred_boxes: np.ndarray,
-    pred_labels: np.ndarray,
-    gt_boxes: np.ndarray,
-    gt_labels: np.ndarray,
-    class_names: List[str],
-    iou_type: str = "bbox",
+    pred_boxes, pred_labels, gt_boxes, gt_labels,
+    class_names, iou_type="bbox",
 ) -> Dict:
-    """
-    Vector-level AP computation via COCO format.
-    Creates temporary COCO JSON structures and calls evaluate_coco().
-    """
-    import json
-    import tempfile
+    """Returns intermediate (as COCO result list) + final dict."""
+    import json, tempfile
     from pycocotools.coco import COCO
     from deeprs_light.evaluator.coco_eval import evaluate_coco
 
-    # Helper: xyxy -> xywh
-    xyxy = gt_boxes
     gt_xywh = np.stack([
-        xyxy[:, 0],
-        xyxy[:, 1],
-        xyxy[:, 2] - xyxy[:, 0],
-        xyxy[:, 3] - xyxy[:, 1],
+        gt_boxes[:, 0], gt_boxes[:, 1],
+        gt_boxes[:, 2] - gt_boxes[:, 0], gt_boxes[:, 3] - gt_boxes[:, 1],
     ], axis=1)
-
     pred_xywh = np.stack([
-        pred_boxes[:, 0],
-        pred_boxes[:, 1],
-        pred_boxes[:, 2] - pred_boxes[:, 0],
-        pred_boxes[:, 3] - pred_boxes[:, 1],
+        pred_boxes[:, 0], pred_boxes[:, 1],
+        pred_boxes[:, 2] - pred_boxes[:, 0], pred_boxes[:, 3] - pred_boxes[:, 1],
     ], axis=1)
 
-    # Build categories
     categories = [{"id": i, "name": name} for i, name in enumerate(class_names)]
 
-    # Build ground truth COCO dict
-    gt_coco = {
-        "images": [{"id": 1, "file_name": "img", "width": 100000, "height": 100000}],
-        "annotations": [],
-        "categories": categories,
-    }
+    # GT annotations (accumulable: image_id offset handled by accumulator)
+    gt_annotations = []
     for i, (box, label) in enumerate(zip(gt_xywh, gt_labels)):
-        gt_coco["annotations"].append({
-            "id": i,
-            "image_id": 1,
-            "category_id": int(label),
+        gt_annotations.append({
+            "id": i, "image_id": 1, "category_id": int(label),
             "bbox": [float(box[0]), float(box[1]), float(box[2]), float(box[3])],
-            "area": float(box[2] * box[3]),
-            "iscrowd": 0,
+            "area": float(box[2] * box[3]), "iscrowd": 0,
         })
-
-    # Build prediction results list
+    # Pred results
     pred_results = []
     for i, (box, label) in enumerate(zip(pred_xywh, pred_labels)):
         pred_results.append({
-            "image_id": 1,
-            "category_id": int(label),
+            "image_id": 1, "category_id": int(label),
             "bbox": [float(box[0]), float(box[1]), float(box[2]), float(box[3])],
             "score": 1.0,
         })
 
-    # Write GT to temp file
+    if len(gt_boxes) == 0:
+        return {"_intermediate": {"type": "ap", "gt_anns": [], "pred_results": [],
+                                  "categories": categories},
+                "AP": 0.0, "AP50": 0.0, "AP75": 0.0}
+
+    # Compute per-pair AP
+    gt_coco = {"images": [{"id": 1, "file_name": "img", "width": 100000, "height": 100000}],
+               "annotations": gt_annotations, "categories": categories}
     with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
         json.dump(gt_coco, f)
         tmp_path = f.name
-
     try:
         coco_gt = COCO(tmp_path)
         coco_dt = coco_gt.loadRes(pred_results)
-        results = evaluate_coco(coco_gt, coco_dt, iou_type=iou_type)
+        final = evaluate_coco(coco_gt, coco_dt, iou_type=iou_type)
     finally:
         os.unlink(tmp_path)
 
-    return results
+    final["_intermediate"] = {
+        "type": "ap", "gt_anns": gt_annotations, "pred_results": pred_results,
+        "categories": categories,
+    }
+    return final
 
 
 def vector_go(
-    pred_boxes: np.ndarray,
-    pred_labels: np.ndarray,
-    gt_boxes: np.ndarray,
-    gt_labels: np.ndarray,
-    iou_threshold: float = 0.5,
+    pred_boxes, pred_labels, gt_boxes, gt_labels, iou_threshold=0.5,
 ) -> Dict:
-    """
-    Vector-level geometric quality (GTC, GOC, GUC).
-
-    Matches pred-gt boxes by class and IoU, then computes area-based metrics.
-    """
+    """Returns intermediate + final for geometric quality."""
     from deeprs_light.data.transforms_utils import compute_iou_matrix
 
-    # Compute areas
     gt_areas = (gt_boxes[:, 2] - gt_boxes[:, 0]) * (gt_boxes[:, 3] - gt_boxes[:, 1])
     pred_areas = (pred_boxes[:, 2] - pred_boxes[:, 0]) * (pred_boxes[:, 3] - pred_boxes[:, 1])
 
-    # Global matching across all classes
-    ious = compute_iou_matrix(gt_boxes, pred_boxes)
-    matches = []
-    gt_matched = set()
-    total_tp, total_fn = 0, 0
+    if len(gt_boxes) == 0:
+        return {"_intermediate": {"type": "go", "tp": 0, "fn": 0,
+                                  "total_gt_area": 0.0, "inter_area_sum": 0.0,
+                                  "weighted_sum": 0.0},
+                "GTC": 0.0, "GOC": 0.0, "GUC": 0.0}
 
-    # Sort predictions by area descending for matching priority
+    ious = compute_iou_matrix(gt_boxes, pred_boxes)
+    gt_matched = set()
+    total_tp = 0
+    inter_area_sum = 0.0
+    weighted_sum = 0.0
+    total_gt_area = float(np.sum(gt_areas))
+
     pred_order = np.argsort(-pred_areas)
     for pred_idx in pred_order:
-        best_iou = 0.0
-        best_gt = -1
+        best_iou, best_gt = 0.0, -1
         for gt_idx in range(len(gt_boxes)):
-            if gt_idx in gt_matched:
-                continue
-            if gt_labels[gt_idx] != pred_labels[pred_idx]:
-                continue
+            if gt_idx in gt_matched: continue
+            if gt_labels[gt_idx] != pred_labels[pred_idx]: continue
             if ious[gt_idx, pred_idx] > best_iou:
-                best_iou = ious[gt_idx, pred_idx]
-                best_gt = gt_idx
+                best_iou, best_gt = ious[gt_idx, pred_idx], gt_idx
         if best_iou >= iou_threshold and best_gt >= 0:
-            matches.append((best_gt, pred_idx))
             gt_matched.add(best_gt)
             total_tp += 1
+            iou_val = best_iou
+            union = gt_areas[best_gt] + pred_areas[pred_idx]
+            inter = iou_val * union / (1.0 + iou_val) if iou_val < 1.0 else min(gt_areas[best_gt], pred_areas[pred_idx])
+            inter_area_sum += inter
+            w = 1.0 if iou_val >= iou_threshold else iou_val / iou_threshold
+            weighted_sum += w * inter
 
     total_fn = len(gt_boxes) - len(gt_matched)
-
-    # GTC
     gtc = total_tp / (total_tp + total_fn) if (total_tp + total_fn) > 0 else 0.0
-
-    # GOC: sum of intersection areas / sum of GT areas
-    inter_area_sum = 0.0
-    total_gt_area = float(np.sum(gt_areas))
-    for gt_idx, pred_idx in matches:
-        # Approximate intersection from IoU * union
-        iou_val = ious[gt_idx, pred_idx]
-        union = gt_areas[gt_idx] + pred_areas[pred_idx]
-        inter = iou_val * union / (1.0 + iou_val) if iou_val < 1.0 else min(gt_areas[gt_idx], pred_areas[pred_idx])
-        inter_area_sum += inter
     goc = inter_area_sum / total_gt_area if total_gt_area > 0 else 0.0
-
-    # GUC: weighted by IoU threshold
-    weighted_sum = 0.0
-    for gt_idx, pred_idx in matches:
-        iou_val = ious[gt_idx, pred_idx]
-        w = 1.0 if iou_val >= iou_threshold else iou_val / iou_threshold
-        union = gt_areas[gt_idx] + pred_areas[pred_idx]
-        inter = iou_val * union / (1.0 + iou_val) if iou_val < 1.0 else min(gt_areas[gt_idx], pred_areas[pred_idx])
-        weighted_sum += w * inter
     guc = weighted_sum / total_gt_area if total_gt_area > 0 else 0.0
 
-    return {"GTC": float(gtc), "GOC": float(goc), "GUC": float(guc)}
+    return {
+        "_intermediate": {"type": "go", "tp": total_tp, "fn": total_fn,
+                          "total_gt_area": total_gt_area,
+                          "inter_area_sum": inter_area_sum,
+                          "weighted_sum": weighted_sum},
+        "GTC": float(gtc), "GOC": float(goc), "GUC": float(guc),
+    }
 
 
 def vector_pl(
-    pred_boxes: np.ndarray,
-    pred_labels: np.ndarray,
-    gt_boxes: np.ndarray,
-    gt_labels: np.ndarray,
-    iou_threshold: float = 0.5,
-    buffer_distance: float = 2.0,
+    pred_boxes, pred_labels, gt_boxes, gt_labels,
+    iou_threshold=0.5, buffer_distance=2.0,
 ) -> Dict:
-    """
-    Vector-level PoLis: center point distance statistics.
-    """
+    """Returns intermediate + final for PoLis."""
     from deeprs_light.data.transforms_utils import compute_iou_matrix
 
-    # Compute centers
+    if len(gt_boxes) == 0:
+        return {"_intermediate": {"type": "pl", "distances": []},
+                "PoLis_mean_dist": 0.0, "PoLis_std_dist": 0.0,
+                "PoLis_median_dist": 0.0, "PoLis_max_dist": 0.0,
+                "PoLis_rmse": 0.0, "PoLis_buffer_rate": 0.0}
+
     gt_cx = (gt_boxes[:, 0] + gt_boxes[:, 2]) / 2
     gt_cy = (gt_boxes[:, 1] + gt_boxes[:, 3]) / 2
     pred_cx = (pred_boxes[:, 0] + pred_boxes[:, 2]) / 2
     pred_cy = (pred_boxes[:, 1] + pred_boxes[:, 3]) / 2
 
-    # Match by IoU (same class)
     ious = compute_iou_matrix(gt_boxes, pred_boxes)
     distances = []
     gt_matched = set()
 
-    pred_order = np.argsort(-(pred_boxes[:, 2] - pred_boxes[:, 0]) * (pred_boxes[:, 3] - pred_boxes[:, 1]))
+    pred_areas = (pred_boxes[:, 2] - pred_boxes[:, 0]) * (pred_boxes[:, 3] - pred_boxes[:, 1])
+    pred_order = np.argsort(-pred_areas)
     for pred_idx in pred_order:
-        best_iou = 0.0
-        best_gt = -1
+        best_iou, best_gt = 0.0, -1
         for gt_idx in range(len(gt_boxes)):
-            if gt_idx in gt_matched:
-                continue
-            if gt_labels[gt_idx] != pred_labels[pred_idx]:
-                continue
+            if gt_idx in gt_matched: continue
+            if gt_labels[gt_idx] != pred_labels[pred_idx]: continue
             if ious[gt_idx, pred_idx] > best_iou:
-                best_iou = ious[gt_idx, pred_idx]
-                best_gt = gt_idx
+                best_iou, best_gt = ious[gt_idx, pred_idx], gt_idx
         if best_iou >= iou_threshold and best_gt >= 0:
             dist = np.sqrt((gt_cx[best_gt] - pred_cx[pred_idx]) ** 2 +
                           (gt_cy[best_gt] - pred_cy[pred_idx]) ** 2)
-            distances.append(dist)
+            distances.append(float(dist))
             gt_matched.add(best_gt)
 
-    if len(distances) == 0:
-        return {
-            "PoLis_mean_dist": 0.0, "PoLis_std_dist": 0.0,
-            "PoLis_median_dist": 0.0, "PoLis_max_dist": 0.0,
-            "PoLis_rmse": 0.0, "PoLis_buffer_rate": 0.0,
-        }
+    dist_arr = np.array(distances) if distances else np.array([])
+    if len(dist_arr) == 0:
+        return {"_intermediate": {"type": "pl", "distances": []},
+                "PoLis_mean_dist": 0.0, "PoLis_std_dist": 0.0,
+                "PoLis_median_dist": 0.0, "PoLis_max_dist": 0.0,
+                "PoLis_rmse": 0.0, "PoLis_buffer_rate": 0.0}
 
-    distances = np.array(distances)
     return {
-        "PoLis_mean_dist": float(np.mean(distances)),
-        "PoLis_std_dist": float(np.std(distances)),
-        "PoLis_median_dist": float(np.median(distances)),
-        "PoLis_max_dist": float(np.max(distances)),
-        "PoLis_rmse": float(np.sqrt(np.mean(distances ** 2))),
-        "PoLis_buffer_rate": float(np.sum(distances <= buffer_distance)) / len(distances),
+        "_intermediate": {"type": "pl", "distances": distances},
+        "PoLis_mean_dist": float(np.mean(dist_arr)),
+        "PoLis_std_dist": float(np.std(dist_arr)),
+        "PoLis_median_dist": float(np.median(dist_arr)),
+        "PoLis_max_dist": float(np.max(dist_arr)),
+        "PoLis_rmse": float(np.sqrt(np.mean(dist_arr ** 2))),
+        "PoLis_buffer_rate": float(np.sum(dist_arr <= buffer_distance)) / len(dist_arr),
     }
 
 
@@ -800,207 +636,400 @@ def vector_pl(
 # ============================================================
 
 def dispatch(
-    mode: str,
-    precision: str,
-    pred_data: Dict,
-    gt_data: Dict,
+    mode: str, precision: str,
+    pred_data: Dict, gt_data: Dict,
     iou_threshold: float = 0.5,
 ) -> Dict:
     """
-    Route to the appropriate computation based on mode and precision type.
-
-    Args:
-        mode: 2-digit mode string.
-        precision: One of 'cm', 'ap', 'go', 'pl'.
-        pred_data: Loaded prediction data dict.
-        gt_data: Loaded ground truth data dict.
-        iou_threshold: IoU threshold for vector matching.
+    Route to the appropriate computation.
 
     Returns:
-        Flat dict of metric name -> value.
+        A dict with both intermediate data ("_intermediate") and final metrics.
     """
     pred_type = pred_data["type"]
     gt_type = gt_data["type"]
 
-    # ---- Mode 00: vector - vector ----
     if pred_type == "vector" and gt_type == "vector":
-        return dispatch_vec_vec(precision, pred_data, gt_data, iou_threshold)
+        return _dispatch_vec_vec(precision, pred_data, gt_data, iou_threshold)
 
-    # ---- Mode 10: raster pred, vector gt ----
     if pred_type == "raster" and gt_type == "vector":
-        # Convert pred raster -> vector, then dispatch as vec-vec
         pred_boxes, pred_labels, pred_class_names, pred_num_classes = \
             raster_to_vector(pred_data["array"], pred_data.get("transform"))
-        pred_vec = {
-            "type": "vector",
-            "boxes": pred_boxes,
-            "labels": pred_labels,
-            "class_names": pred_class_names,
-            "num_classes": pred_num_classes,
-        }
-        return dispatch_vec_vec(precision, pred_vec, gt_data, iou_threshold)
+        pred_vec = {"type": "vector", "boxes": pred_boxes, "labels": pred_labels,
+                    "class_names": pred_class_names, "num_classes": pred_num_classes}
+        return _dispatch_vec_vec(precision, pred_vec, gt_data, iou_threshold)
 
-    # ---- Mode 11: raster - raster ----
     if pred_type == "raster" and gt_type == "raster":
-        return dispatch_ras_ras(precision, pred_data["array"], gt_data["array"],
-                                iou_threshold)
+        return _dispatch_ras_ras(precision, pred_data["array"], gt_data["array"],
+                                 iou_threshold)
 
     raise ValueError(f"Unsupported mode '{mode}' (pred={pred_type}, gt={gt_type})")
 
 
-def dispatch_vec_vec(
-    precision: str,
-    pred_data: Dict,
-    gt_data: Dict,
-    iou_threshold: float,
-) -> Dict:
-    """Vector-vector dispatch."""
+def _dispatch_vec_vec(precision, pred_data, gt_data, iou_threshold) -> Dict:
     pred_boxes = pred_data["boxes"]
     pred_labels = pred_data["labels"]
     gt_boxes = gt_data["boxes"]
     gt_labels = gt_data["labels"]
 
-    # Use union of class sets
     all_labels = sorted(set(pred_labels) | set(gt_labels))
     num_classes = max(len(all_labels), max(all_labels) + 1 if len(all_labels) > 0 else 1)
     class_names = [str(c) for c in range(num_classes)]
 
     if len(gt_boxes) == 0:
-        return _empty_results(precision)
+        return _empty_result(precision)
 
     if precision == "cm":
-        result = vector_cm(pred_boxes, pred_labels, gt_boxes, gt_labels,
-                          num_classes, class_names, iou_threshold)
-        return _flatten_cm(result)
-
+        return vector_cm(pred_boxes, pred_labels, gt_boxes, gt_labels,
+                         num_classes, class_names, iou_threshold)
     elif precision == "ap":
         return vector_ap(pred_boxes, pred_labels, gt_boxes, gt_labels, class_names)
-
     elif precision == "go":
         return vector_go(pred_boxes, pred_labels, gt_boxes, gt_labels, iou_threshold)
-
     elif precision == "pl":
         return vector_pl(pred_boxes, pred_labels, gt_boxes, gt_labels, iou_threshold)
-
     return {}
 
 
-def dispatch_ras_ras(
-    precision: str,
-    pred_arr: np.ndarray,
-    gt_arr: np.ndarray,
-    iou_threshold: float,
-) -> Dict:
-    """Raster-raster dispatch. Uses fast pixel-level path when possible."""
-    # Ensure same shape
+def _dispatch_ras_ras(precision, pred_arr, gt_arr, iou_threshold) -> Dict:
     if pred_arr.shape != gt_arr.shape:
-        raise ValueError(
-            f"Raster shape mismatch: pred {pred_arr.shape} vs gt {gt_arr.shape}."
-        )
+        raise ValueError(f"Raster shape mismatch: pred {pred_arr.shape} vs gt {gt_arr.shape}.")
 
     if precision == "cm":
-        result = pixel_confusion_matrix(pred_arr, gt_arr)
-        return _flatten_cm(result)
-
+        return pixel_confusion_matrix(pred_arr, gt_arr)
     elif precision == "ap":
-        # Must convert both to vector for COCO evaluation
         pred_boxes, pred_labels, pred_class_names, _ = raster_to_vector(pred_arr)
         gt_boxes, gt_labels, gt_class_names, _ = raster_to_vector(gt_arr)
         class_names = list(set(pred_class_names) | set(gt_class_names)) or ["0"]
         if len(gt_boxes) == 0:
-            return _empty_results("ap")
+            return _empty_result("ap")
         return vector_ap(pred_boxes, pred_labels, gt_boxes, gt_labels, class_names)
-
     elif precision == "go":
-        # Pixel-level fast path for geometric quality
         return pixel_geometric_quality(pred_arr, gt_arr)
-
     elif precision == "pl":
         return pixel_polis(pred_arr, gt_arr)
-
     return {}
 
 
-def _empty_results(precision: str) -> Dict:
-    """Return zero-filled results for empty ground truth."""
+def _empty_result(precision: str) -> Dict:
     if precision == "ap":
-        return {"AP": 0.0, "AP50": 0.0, "AP75": 0.0}
+        return {"_intermediate": {"type": "ap", "gt_anns": [], "pred_results": [],
+                                  "categories": [], "num_pairs": 0},
+                "AP": 0.0, "AP50": 0.0, "AP75": 0.0}
     if precision == "cm":
-        return {"macro_precision": 0.0, "macro_recall": 0.0, "macro_f1": 0.0,
-                "micro_precision": 0.0, "micro_recall": 0.0, "micro_f1": 0.0}
+        return {"_intermediate": {"type": "cm", "raw": {}, "all_classes": [],
+                                  "class_names": [], "total_tp": 0,
+                                  "total_fp": 0, "total_fn": 0}}
     if precision == "go":
-        return {"GTC": 0.0, "GOC": 0.0, "GUC": 0.0}
+        return {"_intermediate": {"type": "go", "tp": 0, "fn": 0,
+                                  "total_gt_area": 0.0, "inter_area_sum": 0.0,
+                                  "weighted_sum": 0.0},
+                "GTC": 0.0, "GOC": 0.0, "GUC": 0.0}
     if precision == "pl":
-        return {"PoLis_mean_dist": 0.0, "PoLis_std_dist": 0.0,
+        return {"_intermediate": {"type": "pl", "distances": []},
+                "PoLis_mean_dist": 0.0, "PoLis_std_dist": 0.0,
                 "PoLis_median_dist": 0.0, "PoLis_rmse": 0.0}
     return {}
 
 
-def _flatten_cm(result: Dict) -> Dict:
-    """Flatten nested CM result into flat key-value dict for CSV output."""
-    flat = {}
-    # Per-class
-    for cls_id, metrics in result.get("per_class", {}).items():
-        name = metrics.get("class_name", str(cls_id))
-        for k in ("precision", "recall", "f1", "iou"):
-            if k in metrics:
-                flat[f"{k}_class_{name}"] = metrics[k]
-    # Macro
-    for k, v in result.get("macro_avg", {}).items():
-        flat[f"macro_{k}"] = v
-    # Micro
-    for k, v in result.get("micro_avg", {}).items():
-        flat[f"micro_{k}"] = v
-    return flat
-
-
 # ============================================================
-# Output Writer
+# Batch Accumulator: aggregates intermediate results across pairs
 # ============================================================
 
-def write_csv(all_results: Dict[str, Dict], output_path: str):
+class BatchAccumulator:
     """
-    Write results to CSV.
+    Accumulates intermediate per-pair results and computes overall metrics.
 
-    Format:
-        metric,class,value
-        AP,all,0.45
-        AP50,all,0.72
-        macro_precision,all,0.785
-        GTC,all,0.75
-        PoLis_mean_dist,all,2.3
-        precision_class_0,0,0.85
-        precision_class_1,1,0.72
-        ...
+    This ensures overall metrics are computed from correctly accumulated
+    raw statistics (TP/FP/FN counts, areas, distances), NOT from averaging
+    per-pair derived metrics.
+
+    Usage:
+        acc = BatchAccumulator(precisions=["cm", "go"], iou_threshold=0.5)
+        for each pair:
+            result = dispatch(...)
+            acc.update("pair_name", result)
+        overall = acc.finalize()
+    """
+
+    def __init__(self, precisions: List[str], iou_threshold: float = 0.5):
+        self.precisions = precisions
+        self.iou_threshold = iou_threshold
+        self._num_pairs = 0
+        self._init_accumulators()
+
+    def _init_accumulators(self):
+        """Initialize per-precision accumulators."""
+        # cm: per-class tp/fp/fn + global totals
+        self._cm_raw = {}       # class_id -> {"tp": int, "fp": int, "fn": int}
+        self._cm_classes = set()
+        self._cm_class_names = []
+        self._cm_total_tp = 0
+        self._cm_total_fp = 0
+        self._cm_total_fn = 0
+
+        # ap: accumulated COCO data
+        self._ap_gt_anns = []
+        self._ap_pred_results = []
+        self._ap_categories = []
+        self._ap_image_counter = 0
+
+        # go: accumulated counts + areas
+        self._go_tp = 0
+        self._go_fn = 0
+        self._go_total_gt_area = 0.0
+        self._go_inter_area_sum = 0.0
+        self._go_weighted_sum = 0.0
+
+        # pl: accumulated distances
+        self._pl_distances = []
+
+    def update(self, name: str, result: Dict):
+        """
+        Accumulate intermediate results from one pair.
+
+        Args:
+            name: Pair name (e.g., from pairs CSV "name" column).
+            result: The full result dict returned by dispatch().
+        """
+        inter = result.get("_intermediate", {})
+        if not inter:
+            return
+        prec_type = inter["type"]
+        self._num_pairs += 1
+
+        if prec_type == "cm":
+            self._accumulate_cm(inter)
+        elif prec_type == "ap":
+            self._accumulate_ap(inter)
+        elif prec_type == "go":
+            self._accumulate_go(inter)
+        elif prec_type == "pl":
+            self._accumulate_pl(inter)
+
+    def _accumulate_cm(self, inter: Dict):
+        raw = inter.get("raw", {})
+        self._cm_classes.update(inter.get("all_classes", []))
+        self._cm_class_names = inter.get("class_names", [])
+        self._cm_total_tp += inter.get("total_tp", 0)
+        self._cm_total_fp += inter.get("total_fp", 0)
+        self._cm_total_fn += inter.get("total_fn", 0)
+
+        for cls_id, cnt in raw.items():
+            if cls_id not in self._cm_raw:
+                self._cm_raw[cls_id] = {"tp": 0, "fp": 0, "fn": 0}
+            self._cm_raw[cls_id]["tp"] += cnt["tp"]
+            self._cm_raw[cls_id]["fp"] += cnt["fp"]
+            self._cm_raw[cls_id]["fn"] += cnt["fn"]
+
+    def _accumulate_ap(self, inter: Dict):
+        gt_anns = inter.get("gt_anns", [])
+        pred_results = inter.get("pred_results", [])
+        categories = inter.get("categories", [])
+
+        # Re-index annotations with unique image_id per pair
+        img_id = self._ap_image_counter + 1
+        ann_offset = len(self._ap_gt_anns)
+
+        for ann in gt_anns:
+            ann = dict(ann)
+            ann["id"] += ann_offset
+            ann["image_id"] = img_id
+            self._ap_gt_anns.append(ann)
+
+        for pred in pred_results:
+            pred = dict(pred)
+            pred["image_id"] = img_id
+            self._ap_pred_results.append(pred)
+
+        if categories:
+            self._ap_categories = categories  # use last pair's categories
+        self._ap_image_counter += 1
+
+    def _accumulate_go(self, inter: Dict):
+        self._go_tp += inter.get("tp", 0)
+        self._go_fn += inter.get("fn", 0)
+        self._go_total_gt_area += inter.get("total_gt_area", 0.0)
+        self._go_inter_area_sum += inter.get("inter_area_sum", 0.0)
+        self._go_weighted_sum += inter.get("weighted_sum", 0.0)
+
+    def _accumulate_pl(self, inter: Dict):
+        self._pl_distances.extend(inter.get("distances", []))
+
+    def finalize(self) -> Dict:
+        """
+        Compute overall metrics from accumulated intermediates.
+
+        Returns:
+            Flat dict of metric_name -> value (no nested structure).
+        """
+        overall = {}
+
+        # --- cm finalize ---
+        if "cm" in self.precisions:
+            overall.update(self._finalize_cm())
+
+        # --- ap finalize ---
+        if "ap" in self.precisions:
+            overall.update(self._finalize_ap())
+
+        # --- go finalize ---
+        if "go" in self.precisions:
+            overall.update(self._finalize_go())
+
+        # --- pl finalize ---
+        if "pl" in self.precisions:
+            overall.update(self._finalize_pl())
+
+        return overall
+
+    def _finalize_cm(self) -> Dict:
+        all_classes = sorted(self._cm_classes)
+        n = len(all_classes) or 1
+
+        per_class = {}
+        for c in all_classes:
+            cnt = self._cm_raw.get(c, {"tp": 0, "fp": 0, "fn": 0})
+            tp, fp, fn = cnt["tp"], cnt["fp"], cnt["fn"]
+            p = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+            r = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+            f1 = (2 * p * r / (p + r) if (p + r) > 0 else 0.0)
+            iou = tp / (tp + fp + fn) if (tp + fp + fn) > 0 else 0.0
+            per_class[int(c)] = {"precision": p, "recall": r, "f1": f1, "iou": iou}
+
+        flat = {}
+        for cls_id, metrics in per_class.items():
+            name = str(cls_id)
+            for k in ("precision", "recall", "f1", "iou"):
+                flat[f"{k}_class_{name}"] = metrics[k]
+
+        macro_p = sum(v["precision"] for v in per_class.values()) / n if n > 0 else 0.0
+        macro_r = sum(v["recall"] for v in per_class.values()) / n if n > 0 else 0.0
+        macro_f1 = sum(v["f1"] for v in per_class.values()) / n if n > 0 else 0.0
+        macro_iou = sum(v["iou"] for v in per_class.values()) / n if n > 0 else 0.0
+        flat["macro_precision"] = macro_p
+        flat["macro_recall"] = macro_r
+        flat["macro_f1"] = macro_f1
+        flat["macro_iou"] = macro_iou
+
+        tp, fp, fn = self._cm_total_tp, self._cm_total_fp, self._cm_total_fn
+        mp = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+        mr = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+        flat["micro_precision"] = mp
+        flat["micro_recall"] = mr
+        flat["micro_f1"] = (2 * mp * mr / (mp + mr) if (mp + mr) > 0 else 0.0)
+        flat["micro_iou"] = tp / (tp + fp + fn) if (tp + fp + fn) > 0 else 0.0
+        return flat
+
+    def _finalize_ap(self) -> Dict:
+        if len(self._ap_gt_anns) == 0:
+            return {"AP": 0.0, "AP50": 0.0, "AP75": 0.0,
+                    "AP_s": 0.0, "AP_m": 0.0, "AP_l": 0.0,
+                    "AR1": 0.0, "AR10": 0.0, "AR100": 0.0,
+                    "AR_s": 0.0, "AR_m": 0.0, "AR_l": 0.0}
+
+        import json, tempfile
+        from pycocotools.coco import COCO
+        from deeprs_light.evaluator.coco_eval import evaluate_coco
+
+        # Build combined GT with unique image IDs
+        images = [{"id": i + 1, "file_name": f"img_{i+1}", "width": 100000, "height": 100000}
+                  for i in range(self._ap_image_counter)]
+        gt_coco = {"images": images, "annotations": self._ap_gt_anns,
+                   "categories": self._ap_categories}
+
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+            json.dump(gt_coco, f)
+            tmp_path = f.name
+        try:
+            coco_gt = COCO(tmp_path)
+            coco_dt = coco_gt.loadRes(self._ap_pred_results)
+            return evaluate_coco(coco_gt, coco_dt, iou_type="bbox")
+        finally:
+            os.unlink(tmp_path)
+
+    def _finalize_go(self) -> Dict:
+        gtc = self._go_tp / (self._go_tp + self._go_fn) if (self._go_tp + self._go_fn) > 0 else 0.0
+        goc = self._go_inter_area_sum / self._go_total_gt_area if self._go_total_gt_area > 0 else 0.0
+        guc = self._go_weighted_sum / self._go_total_gt_area if self._go_total_gt_area > 0 else 0.0
+        return {"GTC": gtc, "GOC": goc, "GUC": guc}
+
+    def _finalize_pl(self) -> Dict:
+        if not self._pl_distances:
+            return {"PoLis_mean_dist": 0.0, "PoLis_std_dist": 0.0,
+                    "PoLis_median_dist": 0.0, "PoLis_max_dist": 0.0,
+                    "PoLis_rmse": 0.0, "PoLis_buffer_rate": 0.0}
+        d = np.array(self._pl_distances)
+        buf_dist = 2.0  # default
+        return {
+            "PoLis_mean_dist": float(np.mean(d)),
+            "PoLis_std_dist": float(np.std(d)),
+            "PoLis_median_dist": float(np.median(d)),
+            "PoLis_max_dist": float(np.max(d)),
+            "PoLis_rmse": float(np.sqrt(np.mean(d ** 2))),
+            "PoLis_buffer_rate": float(np.sum(d <= buf_dist)) / len(d),
+        }
+
+
+# ============================================================
+# Output Writer (with pair column)
+# ============================================================
+
+def write_csv_rows(rows: List[Dict], output_path: str):
+    """
+    Write rows to CSV with columns: precision_type, metric, class, pair, value
+
+    Each row dict: {"precision_type": str, "metric": str, "class": str,
+                    "pair": str, "value": float|int|str}
     """
     if not output_path.endswith(".csv"):
-        raise NotImplementedError(
-            f"Only CSV output is supported. Got '{output_path}'."
-        )
-
+        raise NotImplementedError(f"Only CSV output is supported. Got '{output_path}'.")
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
 
-    with open(output_path, "w") as f:
-        f.write("precision_type,metric,class,value\n")
-        for prec_type, metrics in all_results.items():
-            for metric_name, value in metrics.items():
-                # Determine class identifier
-                # Flattened CM keys like "precision_class_ship" -> class="ship"
-                # Other keys like "AP50" -> class="all"
-                if "_class_" in metric_name:
-                    parts = metric_name.rsplit("_class_", 1)
-                    base_metric = parts[0]
-                    class_id = parts[1]
-                else:
-                    base_metric = metric_name
-                    class_id = "all"
+    with open(output_path, "w", newline="") as f:
+        writer = csv_module.writer(f)
+        writer.writerow(["precision_type", "metric", "class", "pair", "value"])
+        for row in rows:
+            val = row["value"]
+            if isinstance(val, float):
+                val = f"{val:.6f}"
+            writer.writerow([row["precision_type"], row["metric"],
+                             row["class"], row["pair"], val])
 
-                if isinstance(value, float):
-                    f.write(f"{prec_type},{base_metric},{class_id},{value:.6f}\n")
-                elif isinstance(value, int):
-                    f.write(f"{prec_type},{base_metric},{class_id},{value}\n")
-                else:
-                    f.write(f"{prec_type},{base_metric},{class_id},{value}\n")
+
+def result_to_rows(precision_type: str, pair_name: str, result: Dict) -> List[Dict]:
+    """
+    Convert a flat result dict into CSV row dicts.
+
+    Args:
+        precision_type: e.g. "cm", "ap", "go", "pl"
+        pair_name: e.g. "region1" or "overall"
+        result: flat dict of metric_name -> value (excluding "_intermediate")
+    """
+    rows = []
+    for metric_name, value in result.items():
+        if metric_name.startswith("_"):  # skip intermediate data
+            continue
+        if isinstance(value, dict):
+            continue  # skip nested (should already be flattened)
+
+        # Determine class identifier
+        if "_class_" in metric_name:
+            parts = metric_name.rsplit("_class_", 1)
+            base_metric = parts[0]
+            class_id = parts[1]
+        else:
+            base_metric = metric_name
+            class_id = "all"
+
+        rows.append({
+            "precision_type": precision_type,
+            "metric": base_metric,
+            "class": class_id,
+            "pair": pair_name,
+            "value": value,
+        })
+    return rows
 
 
 # ============================================================
@@ -1010,43 +1039,148 @@ def write_csv(all_results: Dict[str, Dict], output_path: str):
 def main():
     args = parse_args()
 
-    # Validate
-    validate_mode(args.mode)
     if not args.output.endswith(".csv"):
-        raise NotImplementedError(
-            f"Only CSV output is supported. Got '{args.output}'."
-        )
+        raise NotImplementedError(f"Only CSV output is supported. Got '{args.output}'.")
 
-    pred_field, gt_field = parse_field(args.field)
     precisions = parse_precisions(args.precision)
+    pred_field, gt_field = parse_field(args.field)
     band = args.band if args.band is not None else 1
 
+    # --- Batch mode ---
+    if args.pairs:
+        run_batch(args, precisions, pred_field, gt_field, band)
+    else:
+        # --- Single mode ---
+        run_single(args, precisions, pred_field, gt_field, band)
+
+
+def run_single(args, precisions, pred_field, gt_field, band):
+    """Run single pred-gt pair mode."""
+    if not args.pred or not args.gt or not args.mode:
+        raise ValueError("--pred, --gt, and --mode are required in single mode. "
+                         "Use --pairs for batch mode.")
+
+    validate_mode(args.mode)
     print(f"[acc_ass] mode={args.mode}, precision={precisions}")
     print(f"[acc_ass] pred='{args.pred}', gt='{args.gt}'")
 
-    # Load data
     pred_data = load_data(args.pred, args.mode[0], band, pred_field)
     gt_data = load_data(args.gt, args.mode[1], band, gt_field)
+    pair_name = os.path.splitext(os.path.basename(args.pred))[0]
 
-    print(f"[acc_ass] pred: {pred_data['type']} "
-          f"({'boxes=' + str(pred_data.get('boxes', pred_data.get('array', '')).shape)})")
-    print(f"[acc_ass] gt:   {gt_data['type']} "
-          f"({'boxes=' + str(gt_data.get('boxes', gt_data.get('array', '')).shape)})")
-
-    # Compute
-    all_results = {}
+    all_rows = []
     for prec in precisions:
         print(f"[acc_ass] Computing {prec}...")
         result = dispatch(args.mode, prec, pred_data, gt_data, args.iou)
-        all_results[prec] = result
-        # Print summary
-        for k, v in result.items():
+        # Flatten and extract non-intermediate fields
+        flat = _extract_final(prec, result)
+        rows = result_to_rows(prec, pair_name, flat)
+        all_rows.extend(rows)
+        for k, v in flat.items():
             if isinstance(v, float):
                 print(f"  {k}: {v:.4f}")
 
-    # Output
-    write_csv(all_results, args.output)
+    write_csv_rows(all_rows, args.output)
     print(f"[acc_ass] Results saved to '{args.output}'")
+
+
+def run_batch(args, precisions, pred_field, gt_field, band):
+    """Run batch mode with --pairs CSV."""
+    if not os.path.exists(args.pairs):
+        raise FileNotFoundError(f"Pairs CSV not found: '{args.pairs}'")
+
+    # Read pairs
+    pairs = []
+    with open(args.pairs, "r") as f:
+        reader = csv_module.DictReader(f)
+        for row in reader:
+            name = row.get("name", "").strip()
+            pred = row.get("pred", "").strip()
+            gt = row.get("gt", "").strip()
+            mode = row.get("mode", "").strip()
+            if not pred or not gt or not mode:
+                print(f"[WARN] Skipping incomplete row: {row}")
+                continue
+            if not name:
+                name = os.path.splitext(os.path.basename(pred))[0]
+            validate_mode(mode)
+            pairs.append({"name": name, "pred": pred, "gt": gt, "mode": mode})
+
+    if not pairs:
+        raise ValueError("No valid pairs found in CSV.")
+
+    print(f"[acc_ass] Batch mode: {len(pairs)} pairs, precision={precisions}")
+
+    # Initialize accumulator per precision
+    accumulators = {prec: BatchAccumulator([prec], args.iou) for prec in precisions}
+
+    all_rows = []
+
+    # Process each pair
+    for pair in pairs:
+        name = pair["name"]
+        mode = pair["mode"]
+        print(f"\n[acc_ass] Pair '{name}' | pred='{pair['pred']}' | gt='{pair['gt']}' | mode={mode}")
+
+        pred_data = load_data(pair["pred"], mode[0], band, pred_field)
+        gt_data   = load_data(pair["gt"],   mode[1], band, gt_field)
+
+        for prec in precisions:
+            result = dispatch(mode, prec, pred_data, gt_data, args.iou)
+            inter = result.get("_intermediate", {})
+
+            if inter:
+                accumulators[prec].update(name, result)
+
+            # Per-pair metrics
+            flat = _extract_final(prec, result)
+            rows = result_to_rows(prec, name, flat)
+            all_rows.extend(rows)
+
+            # Print summary
+            print(f"  [{prec}]", end="")
+            for k, v in flat.items():
+                if isinstance(v, float):
+                    print(f" {k}={v:.4f}", end="")
+            print()
+
+    # Compute and write overall metrics
+    print("\n[acc_ass] Computing overall metrics...")
+    for prec in precisions:
+        overall = accumulators[prec].finalize()
+        rows = result_to_rows(prec, "overall", overall)
+        all_rows.extend(rows)
+        print(f"  [{prec} overall]", end="")
+        for k, v in overall.items():
+            if isinstance(v, float):
+                print(f" {k}={v:.4f}", end="")
+        print()
+
+    write_csv_rows(all_rows, args.output)
+    print(f"\n[acc_ass] Results saved to '{args.output}'")
+
+
+def _extract_final(precision_type: str, result: Dict) -> Dict:
+    """Extract the final (non-intermediate) metrics from a result dict."""
+    if precision_type == "cm":
+        return _flatten_cm(result)
+    # For ap/go/pl, just strip _intermediate
+    return {k: v for k, v in result.items() if not k.startswith("_")}
+
+
+def _flatten_cm(result: Dict) -> Dict:
+    """Flatten nested CM result into flat key-value dict."""
+    flat = {}
+    for cls_id, metrics in result.get("per_class", {}).items():
+        name = metrics.get("class_name", str(cls_id))
+        for k in ("precision", "recall", "f1", "iou"):
+            if k in metrics:
+                flat[f"{k}_class_{name}"] = metrics[k]
+    for k, v in result.get("macro_avg", {}).items():
+        flat[f"macro_{k}"] = v
+    for k, v in result.get("micro_avg", {}).items():
+        flat[f"micro_{k}"] = v
+    return flat
 
 
 if __name__ == "__main__":

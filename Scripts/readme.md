@@ -51,15 +51,58 @@ python Scripts/acc_ass.py \
     --output results.csv
 ```
 
+### 批量模式 (Batch Mode)
+
+当有多组预测-真值对需要评估时，除了逐对计算精度，还需要所有对的**总体 (overall) 精度**。overall 指标通过累积中间量（TP/FP/FN 计数、面积、距离等）后统一计算，**不是**各 pair 指标的简单平均。
+
+```bash
+# 批量模式
+python Scripts/acc_ass.py \
+    --pairs pairs.csv \
+    --precision cm,go \
+    --output results.csv
+```
+
+**pairs.csv 格式**：
+
+```csv
+name,pred,gt,mode
+region_1,pred_region1.tif,gt_region1.tif,11
+region_2,pred_region2.tif,gt_region2.tif,11
+region_3,pred_region3.shp,gt_region3.shp,00
+city_a,pred_city.shp,gt_city.shp,00
+```
+
+| 列 | 说明 |
+|----|------|
+| `name` | pair 名称（在输出的 `pair` 列中使用），缺省时自动从 pred 文件名推断 |
+| `pred` | 预测结果路径 |
+| `gt` | 真值路径 |
+| `mode` | 模式字符串 `'xy'`，与单对模式相同 |
+
+#### overall 计算策略
+
+为了保证数学正确性，overall 指标**不通过对各 pair 的结果求平均得到**，而是从原始统计量累加后统一计算：
+
+| 精度 | 累加的中间量 | overall 计算时机 |
+|------|------------|----------------|
+| `cm` | 逐 pair 累加 per-class TP/FP/FN | 全部 pair 跑完后统一算 P/R/F1/IoU |
+| `ap` | 逐 pair 拼接 COCO 预测列表（每条重新分配 image_id） | 全部合并后一次性调 `pycocotools` |
+| `go` | 逐 pair 累加 TP/FN + 交集面积 + GT 面积 | 全部跑完后统一算 GTC/GOC/GUC |
+| `pl` | 逐 pair 拼接距离数组 | 全部跑完后统计 mean/std/rmse |
+
+这保证了 `cm` 的 macro/micro avg 是基于全局 TP/FP/FN 而非各 pair 的简单数值平均；`ap` 的 mAP 是在完整预测集上统一评估，而非 per-pair 再汇总。
+
 ### 参数说明
 
 | 参数 | 类型 | 必需 | 说明 |
 |------|------|------|------|
-| `--pred` | path | 是 | 预测结果路径 (shp/gpkg/tif) |
-| `--gt` | path | 是 | 真值路径 (shp/gpkg/tif) |
-| `--mode` | str | 是 | 两位数字字符串 `'xy'`，见下方模式说明 |
-| `--precision` | str | 是 | 精度类型，逗号分隔或 `all`：`cm`, `ap`, `go`, `pl` |
-| `--output` | path | 是 | 输出 CSV 路径（仅支持 `.csv` 后缀） |
+| `--pred` | path | 单对模式 | 预测结果路径 (shp/gpkg/tif) |
+| `--gt` | path | 单对模式 | 真值路径 (shp/gpkg/tif) |
+| `--mode` | str | 单对模式 | 两位数字字符串 `'xy'`，见下方模式说明 |
+| `--pairs` | path | 批量模式 | CSV 文件，列：`name,pred,gt,mode` |
+| `--precision` | str | **是** | 精度类型，逗号分隔或 `all`：`cm`, `ap`, `go`, `pl` |
+| `--output` | path | **是** | 输出 CSV 路径（仅支持 `.csv` 后缀） |
 | `--field` | str | 否 | 类别字段，见下方字段说明 |
 | `--band` | int | 否 | 栅格波段号（默认 1），矢量输入忽略 |
 | `--iou` | float | 否 | IoU 阈值（默认 0.5） |
@@ -139,21 +182,29 @@ python Scripts/acc_ass.py \
 | `precision_type` | 精度类型：`cm`, `ap`, `go`, `pl` |
 | `metric` | 指标名称 |
 | `class` | 类别标识：`all` 或具体类别名/ID |
+| `pair` | pair 标识：单对模式为预测文件名，批量模式为 `name` 列值或 `overall` |
 | `value` | 指标值（浮点数保留 6 位小数） |
 
-示例输出：
+单对模式示例输出：
 
 ```
-precision_type,metric,class,value
-cm,macro_precision,all,0.785000
-cm,macro_recall,all,0.720000
-cm,precision_class_ship,ship,0.850000
-ap,AP,all,0.450000
-ap,AP50,all,0.720000
-go,GTC,all,0.750000
-go,GOC,all,0.650000
-pl,PoLis_mean_dist,all,2.340000
-pl,PoLis_rmse,all,2.910000
+precision_type,metric,class,pair,value
+cm,macro_precision,all,pred_region1,0.785000
+cm,macro_recall,all,pred_region1,0.720000
+cm,precision_class_ship,ship,pred_region1,0.850000
+```
+
+批量模式示例输出（每个 pair 各自的结果 + overall）：
+
+```
+precision_type,metric,class,pair,value
+cm,macro_precision,all,region_1,0.850000
+cm,macro_precision,all,region_2,0.720000
+cm,macro_precision,all,region_3,0.810000
+cm,macro_precision,all,overall,0.793000
+go,GTC,all,region_1,0.750000
+go,GTC,all,region_2,0.680000
+go,GTC,all,overall,0.715000
 ```
 
 ### 性能说明
