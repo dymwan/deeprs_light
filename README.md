@@ -1,5 +1,7 @@
 # deeprs_light
 
+<img src="cover.png" alt="deeprs_light cover" width="100%">
+
 A lightweight, standardized testing scaffold for remote sensing computer vision.
 Maximum architectural flexibility (CNN, Transformer, Mamba) with engineering
 rigor for the "dirty work" — a foundation for deeprs_v2.
