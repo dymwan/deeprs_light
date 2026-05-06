@@ -20,8 +20,6 @@ tool_use_rules:
    ```bash
    git checkout -b localize
 
-
-
 ## 2. 知识萃取 (Paper-Driven)
 1. **文献检索**：搜索项目根目录或 `docs/` 下的 PDF 文件。
 2. **Target Key 提取**：若存在论文，重点研读其数据预处理章节，明确：
@@ -47,39 +45,17 @@ tool_use_rules:
 
 ---
 
-## References (代码参考模板)
+## References 
 
-当需要修改代码时，严格按照以下模板的结构和规范生成代码。
+### Reference 0：deeprs_light knowledge （deeprs_light.md）
+**场景**：学习 deeprs_light 知识，如果缺失，可寻找 deeprs_light/README.md，或访问 https://github.com/dymwan/deeprs_light。
 
-### Reference 1: Dataset Decoupling Wrapper
+### Reference 1: Dataset Decoupling Wrapper (dataset_wrapper.py)
 **场景**：当需要修改第三方库的数据加载逻辑时，不要直接改源码，而是新建一个包装类。
 
-```python
-import torch
-# 假设从第三方库导入原始 Dataset
-from third_party_repo.datasets import OriginalDataset 
-from deeprs_light.registry import DATASETS
 
-@DATASETS.register_module()
-class DeepRSWrappedDataset(OriginalDataset):
-    """
-    通过继承解耦对第三方库 Dataset 的修改。
-    """
-    def __init__(self, *args, **kwargs):
-        # MODIFIED BY DEEPRS_LIGHT: 默认强制使用 .pt 格式
-        self.use_pt = kwargs.pop('use_pt', True) 
-        super().__init__(*args, **kwargs)
+### Reference 2: DDP Training Boilerplate (deeprs_light_train.py)
+**场景**：生成适配 deeprs_light 的标准化分布式训练脚本。
 
-    def __getitem__(self, idx):
-        # 获取原始数据字典
-        data = super().__getitem__(idx)
-        
-        # MODIFIED BY DEEPRS_LIGHT: 重新映射 Target Keys 并规范数据类型
-        # 例：将原始的 'label' 映射为 deeprs_light 规定的 'mask'
-        formatted_data = {
-            'image': data['img'],
-            # 强制类别标签为 int64，回归任务为 float32
-            'mask': data['label'].to(torch.int64) 
-        }
-        return formatted_data
-  ```
+### eference 3: Changes Tracker Template (deeprs_light_changes.md)
+**场景**：记录当前第三方库中所有的本地化改动。
